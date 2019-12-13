@@ -29,6 +29,9 @@ import (
 	k8s "openebs.io/metac/third_party/kubernetes"
 )
 
+// EmptyConfigPath is a constant representing an unconfigured config path.
+const EmptyConfigPath = ""
+
 // MetacConfigs represents unmarshaled form of all
 // the config files provided to run Metac controllers
 type MetacConfigs []unstructured.Unstructured
@@ -51,6 +54,26 @@ func (mc MetacConfigs) ListGenericControllers() ([]*v1alpha1.GenericController, 
 		gctls = append(gctls, &gctl)
 	}
 	return gctls, nil
+}
+
+// ListDecoratorControllers returns all DecoratorController configs
+func (mc MetacConfigs) ListDecoratorControllers() ([]*v1alpha1.DecoratorController, error) {
+	var ctls []*v1alpha1.DecoratorController
+	for _, u := range mc {
+		if u.GetKind() != "DecoratorController" {
+			continue
+		}
+		raw, err := u.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		ctl := v1alpha1.DecoratorController{}
+		if err := json.Unmarshal(raw, &ctl); err != nil {
+			return nil, err
+		}
+		ctls = append(ctls, &ctl)
+	}
+	return ctls, nil
 }
 
 // Config is the path to metac's Config files

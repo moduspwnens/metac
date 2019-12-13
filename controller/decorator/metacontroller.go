@@ -19,8 +19,10 @@ package decorator
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
+	"github.com/pkg/errors"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +33,7 @@ import (
 	"openebs.io/metac/apis/metacontroller/v1alpha1"
 	mcinformers "openebs.io/metac/client/generated/informers/externalversions"
 	mclisters "openebs.io/metac/client/generated/listers/metacontroller/v1alpha1"
+	"openebs.io/metac/config"
 	"openebs.io/metac/controller/common"
 	dynamicclientset "openebs.io/metac/dynamic/clientset"
 	dynamicdiscovery "openebs.io/metac/dynamic/discovery"
@@ -50,7 +53,24 @@ type Metacontroller struct {
 	queue                workqueue.RateLimitingInterface
 	decoratorControllers map[string]*decoratorController
 
+	crdWatchingDisabled         bool
+	configPathControllerConfigs []*v1alpha1.DecoratorController
+
 	stopCh, doneCh chan struct{}
+
+	// Total timeout for any condition to succeed.
+	//
+	// NOTE:
+	//	This is currently used to load config that is required
+	// to run Metac.
+	waitTimeoutForCondition time.Duration
+
+	// Interval between retries for any condition to succeed.
+	//
+	// NOTE:
+	// 	This is currently used to load config that is required
+	// to run Metac
+	waitIntervalForCondition time.Duration
 }
 
 // NewMetacontroller returns a new instance of Metacontroller
@@ -60,6 +80,7 @@ func NewMetacontroller(
 	dynInformers *dynamicinformer.SharedInformerFactory,
 	mcInformerFactory mcinformers.SharedInformerFactory,
 	workerCount int,
+	configPath string,
 ) *Metacontroller {
 
 	mc := &Metacontroller{
@@ -73,7 +94,35 @@ func NewMetacontroller(
 		queue:                workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DecoratorController"),
 		decoratorControllers: make(map[string]*decoratorController),
 		workerCount:          workerCount,
+
+		waitTimeoutForCondition:  30 * time.Minute,
+		waitIntervalForCondition: 1 * time.Second,
 	}
+
+	var ctlsAsConfig []*v1alpha1.DecoratorController
+	var ctlsAsConfigErr error
+	// NOTE: ConfigPath has higher priority to get the
+	// GenericController instances as configs to run Metac
+	if configPath != "" {
+
+		mc.crdWatchingDisabled = true
+
+		mconfigs, err := config.New(configPath).Load()
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("failed to load DecoratorController configs from config path: %v", configPath))
+			return nil
+		}
+		ctlsAsConfig, ctlsAsConfigErr = mconfigs.ListDecoratorControllers()
+	} else {
+		mc.crdWatchingDisabled = false
+	}
+
+	if ctlsAsConfigErr != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to load DecoratorControllers from config path: %v", configPath))
+		return nil
+	}
+
+	mc.configPathControllerConfigs = ctlsAsConfig
 
 	mc.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    mc.enqueueDecoratorController,
@@ -82,6 +131,10 @@ func NewMetacontroller(
 	})
 
 	return mc
+}
+
+func (mc *Metacontroller) String() string {
+	return "Local DecoratorController"
 }
 
 // Start this controller
@@ -94,17 +147,74 @@ func (mc *Metacontroller) Start() {
 		defer utilruntime.HandleCrash()
 
 		glog.Info("Starting DecoratorController metacontroller")
-		defer glog.Info("Shutting down DecoratorController metacontroller")
 
-		if !k8s.WaitForCacheSync("DecoratorController", mc.stopCh, mc.informer.HasSynced) {
-			return
-		}
+		if mc.crdWatchingDisabled {
 
-		// In the metacontroller, we are only responsible for starting/stopping
-		// the actual controllers, so a single worker should be enough.
-		for mc.processNextWorkItem() {
+			glog.Infof("DecoratorController ConfigPath controller configs: %v", mc.configPathControllerConfigs)
+
+			// we run this as a continuous process
+			// until all the configs are loaded
+			condErr := mc.wait(mc.startAllDecoratorControllers)
+			if condErr != nil {
+				glog.Fatalf("%s: Failed to start: %v", mc, condErr)
+			}
+
+		} else {
+			defer glog.Info("Shutting down DecoratorController metacontroller")
+
+			if !k8s.WaitForCacheSync("DecoratorController", mc.stopCh, mc.informer.HasSynced) {
+				return
+			}
+
+			// In the metacontroller, we are only responsible for starting/stopping
+			// the actual controllers, so a single worker should be enough.
+			for mc.processNextWorkItem() {
+			}
 		}
 	}()
+}
+
+// wait polls the condition until it's true, with a configured
+// interval and timeout.
+//
+// The condition function returns a bool indicating whether it
+// is satisfied, as well as an error which should be non-nil if
+// and only if the function was unable to determine whether or
+// not the condition is satisfied (for example if the check
+// involves calling a remote server and the request failed).
+func (mc *Metacontroller) wait(condition func() (bool, error)) error {
+	// mark the start time
+	start := time.Now()
+	for {
+		done, err := condition()
+		if err == nil && done {
+			return nil
+		}
+		if time.Since(start) > mc.waitTimeoutForCondition {
+			return errors.Errorf(
+				"%s: Wait condition timed out %s: %v", mc, mc.waitTimeoutForCondition, err,
+			)
+		}
+		if err != nil {
+			// Log error, but keep trying until timeout.
+			glog.V(4).Infof("%s: Wait condition failed: Will retry: %v", mc, err)
+		} else {
+			glog.V(4).Infof("%s: Waiting for condition to succeed: Will retry", mc)
+		}
+		time.Sleep(mc.waitIntervalForCondition)
+	}
+}
+
+func (mc *Metacontroller) startAllDecoratorControllers() (bool, error) {
+	for _, c := range mc.configPathControllerConfigs {
+		err := mc.syncDecoratorController(c)
+
+		if err != nil {
+			glog.V(4).Infof("Error occurred starting decorator controller %v: %v", c.ObjectMeta.Name, err)
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // Stop this controller

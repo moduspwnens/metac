@@ -27,6 +27,7 @@ import (
 	"openebs.io/metac/apis/metacontroller/v1alpha1"
 	metaclientset "openebs.io/metac/client/generated/clientset/versioned"
 	metainformers "openebs.io/metac/client/generated/informers/externalversions"
+	"openebs.io/metac/config"
 	"openebs.io/metac/controller/composite"
 	"openebs.io/metac/controller/decorator"
 	"openebs.io/metac/controller/generic"
@@ -121,6 +122,7 @@ func (s *CRDBasedServer) Start(workerCount int) (stop func(), err error) {
 			dynamicInformerFactory,
 			metaInformerFactory,
 			workerCount,
+			config.EmptyConfigPath,
 		),
 		generic.NewCRDBasedMetaController(
 			resourceMgr,
@@ -214,6 +216,18 @@ func (s *ConfigBasedServer) Start(workerCount int) (stop func(), err error) {
 		return nil, err
 	}
 
+	// Create informer factory for metacontroller API objects.
+	metaClientset, err := metaclientset.NewForConfig(s.Config)
+	if err != nil {
+		return nil, errors.Wrapf(
+			err,
+			"%s: Start server failed: Can't create clientset",
+			v1alpha1.SchemeGroupVersion,
+		)
+	}
+	metaInformerFactory :=
+		metainformers.NewSharedInformerFactory(metaClientset, s.InformerRelist)
+
 	// Start various metacontrollers (controllers that spawn controllers).
 	// Each one requests the informers it needs from the factory.
 	metaControllers := []controller{
@@ -224,6 +238,14 @@ func (s *ConfigBasedServer) Start(workerCount int) (stop func(), err error) {
 		// Support for other controllers will be introduced once
 		// config mode for GenericController works fine.
 		genericMetac,
+		decorator.NewMetacontroller(
+			resourceMgr,
+			dynamicClientset,
+			dynamicInformerFactory,
+			metaInformerFactory,
+			workerCount,
+			s.ConfigPath,
+		),
 	}
 
 	// Start all controllers.
